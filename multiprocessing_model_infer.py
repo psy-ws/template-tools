@@ -1,105 +1,138 @@
 import os
-import queue
-import threading
-from typing import Callable, Any, Iterable, Optional
+import sys
+sys.path.append("third_party/Matcha-TTS")
+import multiprocessing as mp
+import torch
+import torchaudio
 
-# ====== 配置 ======
+# 配置参数
 NUM_GPUS = 8
-WORKERS_PER_GPU = 1          # 通常先 1；想加并发再改 2
-CPU_THREADS_PER_WORKER = 1   # 防止“线程套线程”把CPU搞炸
-
-# 必须在 import torch/numpy 等前设置
-os.environ["OMP_NUM_THREADS"] = str(CPU_THREADS_PER_WORKER)
-os.environ["MKL_NUM_THREADS"] = str(CPU_THREADS_PER_WORKER)
-os.environ["OPENBLAS_NUM_THREADS"] = str(CPU_THREADS_PER_WORKER)
-os.environ["NUMEXPR_NUM_THREADS"] = str(CPU_THREADS_PER_WORKER)
+WORKERS_PER_GPU = 3  # 强烈建议先 1；2 往往更慢且更容易把CPU调度打爆
+CPU_THREADS_PER_WORKER = 1  # 限制每个进程的CPU线程数（非常关键：避免 进程数 × 线程数 造成load爆炸）
 
 
-# ====== 你需要实现的两个函数 ======
-def init_on_gpu(gpu_id: int) -> Any:
-    """
-    你实现：在指定 GPU 上初始化资源（例如加载模型），并返回 handle/model。
-    这个函数每个 GPU worker 线程只会调用一次。
-    """
-    raise NotImplementedError
+def worker(gpu_id, task_queue):
 
+    # 在导入 torch 前设置CUDA可见卡
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    # 限制 BLAS/OMP 线程数（必须在相关库初始化前设置）
+    os.environ["OMP_NUM_THREADS"] = str(CPU_THREADS_PER_WORKER)
+    os.environ["MKL_NUM_THREADS"] = str(CPU_THREADS_PER_WORKER)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(CPU_THREADS_PER_WORKER)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(CPU_THREADS_PER_WORKER)
 
-def run_one(handle: Any, task: Any, gpu_id: int) -> None:
-    """
-    你实现：用 handle 在 gpu_id 上处理单个 task（推理/保存/返回结果都行）。
-    """
-    raise NotImplementedError
-
-
-# ====== 模板核心（不用改） ======
-def _gpu_thread_loop(
-    gpu_id: int,
-    q: "queue.Queue[Optional[Any]]",
-    init_fn: Callable[[int], Any],
-    run_fn: Callable[[Any, Any, int], None],
-):
-    # 绑定当前线程到固定GPU（线程级别绑定：不要用 CUDA_VISIBLE_DEVICES）
-    import torch
+    # 再次限制 PyTorch 线程池（对 CPU 侧开线程很有效）
     torch.set_num_threads(CPU_THREADS_PER_WORKER)
     torch.set_num_interop_threads(CPU_THREADS_PER_WORKER)
-    torch.cuda.set_device(gpu_id)
 
-    handle = init_fn(gpu_id)
+    device = torch.device("cuda:0")  # 逻辑0即物理gpu_id（因CUDA_VISIBLE_DEVICES已重映射）
+    print(f"[PID {os.getpid()}] Worker start on physical GPU {gpu_id} (logical {device})", flush=True)
+
+
+
+    ########################  step2:加载模型（init每个模型只运行一次）   ###########################
+    # 初始化模型（如果 AutoModel 支持 device 参数，你可以改成 AutoModel(model_dir=MODEL_DIR, device=device)）
+    from cosyvoice.cli.cosyvoice import AutoModel
+    cosyvoice = AutoModel(model_dir='pretrained_models/CosyVoice2-0.5B')
+    os.makedirs("./output", exist_ok=True)
+    output_dir = "./output"
+    ###########################################################################################
+
+
 
     while True:
-        task = q.get()
+        task = task_queue.get()
         try:
             if task is None:
                 return
-            run_fn(handle, task, gpu_id)
+
+            ########################  step3:运行函数   ###########################
+            uttrans_id, text = task
+            spk = uttrans_id[:5]
+            text_clean = text.replace(" ", "")
+
+            save_subdir = os.path.join(output_dir, spk)
+            os.makedirs(save_subdir, exist_ok=True)
+            output_path = os.path.join(save_subdir, f"{uttrans_id}.wav")
+
+            if os.path.exists(output_path):
+                # 已存在直接跳过
+                print(uttrans_id, "  exists !!!!")
+                continue
+
+            prompt_wav = (
+                f"/gruntdata/heyuan29/jiazj/psy/datasets/test_datasets/datasets/"
+                f"Guangzhou_Cantonese_Scripted_Speech_Corpus_in_Vehicle/WAV/{spk}/{spk}_1_S0001.wav"
+            )
+
+            # 推理并保存
+            # 如果 inference_instruct2 会产出多段，这里会用最后一次 save 覆盖同一路径；
+            # 若你希望保存多段，请改文件名（加上 i）。
+            for i, j in enumerate(
+                cosyvoice.inference_instruct2(
+                    text_clean,
+                    "用广东话粤语说这句话<|endofprompt|>",
+                    prompt_wav,
+                )
+            ):
+                torchaudio.save(output_path, j["tts_speech"], cosyvoice.sample_rate)
+            ######################################################################
+
+
+
+        except Exception as e:
+            print(f"[PID {os.getpid()}][GPU {gpu_id}] Error: {e}", flush=True)
         finally:
-            q.task_done()
+            # 只在这里调用一次，避免 task_done() 次数不匹配
+            task_queue.task_done()
 
 
-def run_multigpu_threads(
-    tasks: Iterable[Any],
-    init_fn: Callable[[int], Any],
-    run_fn: Callable[[Any, Any, int], None],
-    num_gpus: int = NUM_GPUS,
-    workers_per_gpu: int = WORKERS_PER_GPU,
-    queue_size: int = 128,
-):
-    q: "queue.Queue[Optional[Any]]" = queue.Queue(maxsize=queue_size)
+def multi_gpu_process():
+    
 
-    threads = []
-    for i in range(num_gpus * workers_per_gpu):
-        gpu_id = i % num_gpus
-        t = threading.Thread(
-            target=_gpu_thread_loop,
-            args=(gpu_id, q, init_fn, run_fn),
-            daemon=False,
-        )
-        t.start()
-        threads.append(t)
+    ########################  step1:读任务   ###########################
+    tasks = []
+    txt_path = "/gruntdata/heyuan29/jiazj/psy/datasets/test_datasets/datasets/Guangzhou_Cantonese_Scripted_Speech_Corpus_in_Vehicle/text.txt"
+    with open(txt_path, "r", encoding="utf-8") as fr:
+        for line in fr:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                # 如果文本里本来可能包含空格，你想保留空格的话用：' '.join(parts[1:])
+                tasks.append((parts[0], parts[1]))
+    ##################################################################
+
+    task_queue = mp.JoinableQueue(maxsize=NUM_GPUS * WORKERS_PER_GPU * 4)
+
+    # 先启动worker
+    processes = []
+    total_workers = NUM_GPUS * WORKERS_PER_GPU
+    for i in range(total_workers):
+        gpu_id = i % NUM_GPUS
+        p = mp.Process(target=worker, args=(gpu_id, task_queue))
+        p.start()
+        processes.append(p)
 
     # 投喂任务
-    for task in tasks:
-        q.put(task)
+    for t in tasks:
+        task_queue.put(t)
 
-    # 结束信号：每个线程一个 None
-    for _ in threads:
-        q.put(None)
+    # 结束信号（每个worker一个None）
+    for _ in range(total_workers):
+        task_queue.put(None)
 
-    q.join()
-    for t in threads:
-        t.join()
+    # 等待所有任务完成
+    task_queue.join()
+
+    # 回收进程
+    for p in processes:
+        p.join()
 
 
-# ====== 使用示例 ======
+
 if __name__ == "__main__":
-    # 例：tasks 你可以换成读文件/数据库/生成器等
-    tasks = [(i, f"text_{i}") for i in range(1000)]
 
-    run_multigpu_threads(
-        tasks=tasks,
-        init_fn=init_on_gpu,
-        run_fn=run_one,
-        num_gpus=NUM_GPUS,
-        workers_per_gpu=WORKERS_PER_GPU,
-        queue_size=NUM_GPUS * WORKERS_PER_GPU * 4,
-    )
+    mp.set_start_method("spawn", force=True)
+    multi_gpu_process()
